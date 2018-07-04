@@ -713,10 +713,6 @@ static long scif_chrdev_ioctl(struct file *filp, unsigned int cmd,
 	int host_ret_val = -1;
 	__u32 ses_id;
 
-	//struct timeval t0,t1,t2,t3,t4,t5,t6;
-	//long temp;
-	//do_gettimeofday(&t0);
-
 	debug("Entering PID: %d\n", current->pid);
 
 	packet = kmalloc(sizeof(*packet), GFP_KERNEL);

@@ -1,0 +1,749 @@
+diff -Nur mpss-3.5.2-src-orig/include/mic/micscif.h mpss-3.5.2-src-modified/include/mic/micscif.h
+--- mpss-3.5.2-src-orig/include/mic/micscif.h	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/include/mic/micscif.h	2018-03-20 17:39:13.568976194 +0200
+@@ -521,6 +521,8 @@
+ int scif_user_recv(scif_epd_t epd, void *msg, int len, int flags);
+ int __scif_pin_pages(void *addr, size_t len, int *out_prot,
+ 	int map_flags, scif_pinned_pages_t *pages);
++int __scif_pin_pagesv(struct sg_entry *sg_addrs, size_t len, int *out_prot,
++	int map_flags, scif_pinned_pages_t *pages);
+ scif_epd_t __scif_open(void);
+ int __scif_bind(scif_epd_t epd, uint16_t pn);
+ int __scif_listen(scif_epd_t epd, int backlog);
+@@ -532,6 +534,8 @@
+ int __scif_recv(scif_epd_t epd, void *msg, int len, int flags);
+ off_t __scif_register(scif_epd_t epd, void *addr, size_t len, off_t offset,
+ int prot_flags, int map_flags);
++off_t __scif_registerv(scif_epd_t epd, struct sg_entry *sg_addrs, size_t len, off_t offset,
++int prot_flags, int map_flags);
+ int __scif_unregister(scif_epd_t epd, off_t offset, size_t len);
+ int __scif_readfrom(scif_epd_t epd, off_t loffset, size_t len, off_t
+ roffset, int rma_flags);
+diff -Nur mpss-3.5.2-src-orig/include/mic/micscif_rma_list.h mpss-3.5.2-src-modified/include/mic/micscif_rma_list.h
+--- mpss-3.5.2-src-orig/include/mic/micscif_rma_list.h	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/include/mic/micscif_rma_list.h	2018-07-09 17:17:48.868327529 +0300
+@@ -115,6 +115,24 @@
+ 	struct list_head list_member;
+ };
+ 
++
++/*
++ * The private data field of each VMA used to mmap a remote window
++ * points to an instance of struct vma_pvt
++ */
++struct vma_pvt {
++	u64 *pfns;
++
++	struct endpt *ep;	/* End point for remote window */
++	uint64_t offset;	/* offset within remote window */
++	bool valid_offset;	/* offset is valid only if the original
++				 * mmap request was for a single page
++				 * else the offset within the vma is
++				 * the correct offset
++				 */
++	struct kref ref;
++};
++
+ /* Insert */
+ void micscif_insert_window(struct reg_range_t *window, struct list_head *head);
+ void micscif_insert_tcw(struct reg_range_t *window,
+@@ -131,7 +149,8 @@
+ void micscif_rma_list_munmap(struct reg_range_t *window, uint64_t offset, int nr_pages);
+ /* Traverse list and mmap */
+ int micscif_rma_list_mmap(struct reg_range_t *start_window,
+-			  uint64_t offset, int nr_pages, struct vm_area_struct *vma);
++			  uint64_t offset, int nr_pages, struct vm_area_struct *vma, struct vma_pvt *vmapvt);
++			  //uint64_t offset, int nr_pages, struct vm_area_struct *vma);
+ /* Traverse list and unregister */
+ int micscif_rma_list_unregister(struct reg_range_t *window, uint64_t offset, int nr_pages);
+ 
+diff -Nur mpss-3.5.2-src-orig/include/scif.h mpss-3.5.2-src-modified/include/scif.h
+--- mpss-3.5.2-src-orig/include/scif.h	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/include/scif.h	2018-03-20 17:36:31.288983334 +0200
+@@ -216,6 +216,12 @@
+ 
+ typedef struct scif_pinned_pages *scif_pinned_pages_t;
+ 
++struct sg_entry {
++	void		*addr;
++//	uint64_t	len;
++};
++
++
+ struct scif_range {
+ 	void *cookie;		/* cookie */
+ 	int nr_pages;		/* Number of Pages */
+@@ -1382,6 +1388,68 @@
+ 	size_t len,
+ 	int prot_flags,
+ 	int map_flags,
++	scif_pinned_pages_t *pinned_pages);
++
++/**
++ * scif_pin_pagesv - Pin a set of pages (sg variant)
++ * 	\param addr		Virtual address of range to pin
++ * 	\param len		Length of range to pin
++ * 	\param prot_flags 	Page protection flags
++ * 	\param map_flags	Page classification flags
++ * 	\param pinned_pages	Opaque handle of pinned pages
++ *
++ * scif_pin_pages() pins (locks in physical memory) the physical pages which
++ * back the range of virtual address pages starting at addr and continuing for
++ * len bytes. addr and len are constrained to be multiples of the page size. A
++ * successful scif_register() call returns an opaque pointer value at
++ * pinned_pages which may be used in subsequent calls to
++ * scif_register_pinned_pages().
++ *
++ * The pages will remain pinned as long as there is a reference against the
++ * scif_pinned_pages_t value returned by scif_pin_pages() and until
++ * scif_unpin_pages() is called, passing the scif_pinned_pages_t value. A
++ * reference is added to a scif_pinned_pages_t value each time a window is
++ * created by calling scif_register_pinned_pages() and passing the
++ * scif_pinned_pages_t value. A reference is removed from a scif_pinned_pages_t value
++ * each time such a window is deleted.
++ *
++ * Subsequent operations which change the memory pages to which virtual
++ * addresses are mapped (such as mmap(), munmap(), scif_mmap() and
++ * scif_munmap()) have no effect on the scif_pinned_pages_t value or windows
++ * created against it.
++ *
++ * On Linux, if the process will fork(), it is recommended that the registered
++ * virtual address range be marked with MADV_DONTFORK. Doing so will prevent
++ * problems due to copy-on-write semantics.
++ *
++ * The prot_flags argument is formed by OR'ing together one or more of the
++ * following values:
++ *- SCIF_PROT_READ: allow read operations against the pages
++ *- SCIF_PROT_WRITE: allow write operations against the pages
++ * The map_flags argument is formed by OR'ing together zero or more of the
++ * following values:
++ *- SCIF_MAP_KERNEL: interpret addr as a kernel space address. By default, addr
++ *  is interpreted as a user space address.
++ *
++ *\return
++ * Upon successful completion, scif_register() returns 0; otherwise the
++ * negative of one of the following errors is returned.
++ *\par Errors:
++ *- EFAULT
++ * - Addresses in the range [addr,addr+len-1]  are invalid
++ *- EINVAL
++ * - prot_flags is invalid,
++ * - map_flags is invalid, or
++ * - offset is negative
++ *- ENOMEM
++ * - Not enough space
++ */
++int
++scif_pin_pagesv(
++	struct sg_entry *sg_addrs,
++	size_t len,
++	int prot_flags,
++	int map_flags,
+ 	scif_pinned_pages_t *pinned_pages);
+ 
+ /**
+diff -Nur mpss-3.5.2-src-orig/include/scif_ioctl.h mpss-3.5.2-src-modified/include/scif_ioctl.h
+--- mpss-3.5.2-src-orig/include/scif_ioctl.h	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/include/scif_ioctl.h	2018-07-09 17:20:34.420320246 +0300
+@@ -121,6 +121,27 @@
+ };
+ 
+ /**
++ * struct scifioctl_regv:
++ *
++ * \param addr starting virtual address
++ * \param len			length of range
++ * \param offset		offset of window
++ * \param prot			read/write protection
++ * \param flags			flags
++ * \param out_len		offset returned.
++ *
++ * This structure is used for SCIF_REGV IOCTL.
++ */
++struct scifioctl_regv {
++	struct sg_entry	*sg_array;
++	uint64_t	nr_pages;
++	off_t		offset;
++	int		prot;
++	int		flags;
++	off_t		out_offset;
++};
++
++/**
+  * struct scifioctl_unreg:
+  *
+  * \param offset		start of range to unregister
+@@ -221,5 +242,6 @@
+ #define SCIF_FENCE_MARK		_IOWR('s', 15, struct scifioctl_fence_mark *)
+ #define SCIF_FENCE_WAIT		_IOWR('s', 16, int)
+ #define SCIF_FENCE_SIGNAL	_IOWR('s', 17, struct scifioctl_fence_signal *)
++#define SCIF_REGV		_IOWR('s', 18, struct scifioctl_regv *)
+ 
+ #define SCIF_GET_VERSION	_IO('s', 23)
+diff -Nur mpss-3.5.2-src-orig/micscif/micscif_api.c mpss-3.5.2-src-modified/micscif/micscif_api.c
+--- mpss-3.5.2-src-orig/micscif/micscif_api.c	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/micscif/micscif_api.c	2018-07-09 17:40:54.508266566 +0300
+@@ -2061,6 +2061,154 @@
+ EXPORT_SYMBOL(scif_pin_pages);
+ 
+ /**
++ * __scif_pin_pagesv - __scif_pin_pagesv() pins the physical pages which back
++ * the range of virtual address pages starting at addr and continuing for
++ * len bytes. addr and len are constrained to be multiples of the page size.
++ * A successful  scif_register() call returns an opaque pointer value
++ * which may be used in subsequent calls to scif_register_pinned_pages().
++ *
++ * Return Values
++ * Upon successful completion, __scif_pin_pagesv() returns a
++ * scif_pinned_pages_t value else an apt error is returned as documented
++ * in scif.h. Protections of the set of pinned pages are also returned by
++ * reference via out_prot.
++ */
++int
++__scif_pin_pagesv(struct sg_entry *sg_addrs, size_t len, int *out_prot,
++		int map_flags, scif_pinned_pages_t *pages)
++{
++	struct scif_pinned_pages *pinned_pages;
++	struct page *start_page;
++	struct vm_area_struct *start_vma;
++	int nr_pages, err = 0, i;
++	bool vmalloc_addr = false;
++	bool try_upgrade = false;
++	int prot = *out_prot;
++	int ulimit = 0;
++	struct mm_struct *mm = NULL;
++	int pinned_page_ret, failure;
++
++	/* Unsupported flags */
++	if (map_flags & ~(SCIF_MAP_KERNEL | SCIF_MAP_ULIMIT))
++		return -EINVAL;
++	ulimit = !!(map_flags & SCIF_MAP_ULIMIT);
++
++	/* Unsupported protection requested */
++	if (prot & ~(SCIF_PROT_READ | SCIF_PROT_WRITE))
++		return -EINVAL;
++
++//	/* addr/len must be page aligned. len should be non zero */
++//	if ((!len) ||
++//		(align_low((uint64_t)addr, PAGE_SIZE) != (uint64_t)addr) ||
++//		(align_low((uint64_t)len, PAGE_SIZE) != (uint64_t)len))
++//		return -EINVAL;
++
++	might_sleep();
++
++	nr_pages = (int)(len >> PAGE_SHIFT);
++
++	/* Allocate a set of pinned pages */
++	if (!(pinned_pages = micscif_create_pinned_pages(nr_pages, prot)))
++		return -ENOMEM;
++
++	if (unlikely(map_flags & SCIF_MAP_KERNEL)) {
++//		if (is_vmalloc_addr(addr))
++//			vmalloc_addr = true;
++//
++//		for (i = 0; i < nr_pages; i++) {
++//			if (unlikely(vmalloc_addr))
++//				pinned_pages->pages[i] =
++//					vmalloc_to_page((char *)addr + (i * PAGE_SIZE) );
++//			else
++//				pinned_pages->pages[i] =
++//					virt_to_page((char *)addr + (i * PAGE_SIZE) );
++//			pinned_pages->num_pages[i] = 1;
++//			pinned_pages->nr_contig_chunks++;
++//		}
++//		pinned_pages->nr_pages = nr_pages;
++//		pinned_pages->map_flags = SCIF_MAP_KERNEL;
++	} else {
++		if (prot == SCIF_PROT_READ)
++			try_upgrade = true;
++		prot |= SCIF_PROT_WRITE;
++retry:
++		mm = current->mm;
++		down_write(&mm->mmap_sem);
++		if (ulimit) {
++			err = __scif_check_inc_pinned_vm(mm, nr_pages);
++			if (err) {
++				up_write(&mm->mmap_sem);
++				pinned_pages->nr_pages = 0;
++				goto error_unmap;
++			}
++		}
++
++		failure = 0;
++		for (i = 0; i < nr_pages; i++) {
++			pinned_page_ret = get_user_pages(
++					current,
++					mm,
++					(uint64_t)(sg_addrs[i].addr),
++					1, //single-page pinning
++					!!(prot & SCIF_PROT_WRITE),
++					0,
++					&(pinned_pages->pages[i]),
++					&(pinned_pages->vma[0]));
++
++			if (pinned_page_ret != 1) {
++				failure = 1;
++				break;
++			}
++			pinned_pages[i].nr_pages = 1;
++
++			micscif_detect_large_page(&(pinned_pages[i]), sg_addrs[i].addr);
++		}
++		up_write(&mm->mmap_sem);
++		
++		if (failure) {
++			printk(KERN_ALERT "FAILURE\n"); 
++		}
++
++		pinned_pages->map_flags = 0;
++	}
++
++	*out_prot = prot;
++	atomic_set(&pinned_pages->ref_count, nr_pages);
++	*pages = pinned_pages;
++	return err;
++dec_pinned:
++	if (ulimit)
++		__scif_dec_pinned_vm_lock(mm, nr_pages, 0);
++	/* Something went wrong! Rollback */
++error_unmap:
++	pinned_pages->nr_pages = nr_pages;
++	micscif_destroy_pinned_pages(pinned_pages);
++	*pages = NULL;
++	pr_debug("%s %d err %d len 0x%lx\n", __func__, __LINE__, err, len);
++	return err;
++}
++
++/**
++ * scif_pin_pagesv - scif_pin_pagesv() pins the physical pages which back
++ * the range of virtual address pages starting at addr and continuing for
++ * len bytes. addr and len are constrained to be multiples of the page size.
++ * A successful  scif_register() call returns an opaque pointer value
++ * which may be used in subsequent calls to scif_register_pinned_pages().
++ *
++ * Return Values
++ * Upon successful completion, scif_register() returns a
++ * scif_pinned_pages_t value else an apt error is returned as documented
++ * in scif.h
++ */
++int
++scif_pin_pagesv(struct sg_entry *sg_addrs, size_t len, int prot,
++		int map_flags, scif_pinned_pages_t *pages)
++{
++	return __scif_pin_pagesv(sg_addrs, len, &prot, map_flags, pages);
++}
++EXPORT_SYMBOL(scif_pin_pagesv);
++
++/**
+  * scif_unpin_pages: Unpin a set of pages
+  *
+  * Return Values:
+@@ -2578,6 +2726,7 @@
+ 		mm = __scif_acquire_mm();
+ 		map_flags |= SCIF_MAP_ULIMIT;
+ 	}
++
+ 	/* Pin down the pages */
+ 	if ((err = scif_pin_pages(addr, len, prot,
+ 			map_flags & (SCIF_MAP_KERNEL | SCIF_MAP_ULIMIT),
+@@ -2627,6 +2776,134 @@
+ 	return err;
+ }
+ 
++/**
++ * scif_registerv - Mark a memory region for remote access (sg case).
++ *	@epd:		endpoint descriptor
++ *	@addr:		starting virtual address
++ *	@len:		length of range
++ *	@offset:	offset of window
++ *	@prot:		read/write protection
++ *	@map_flags:	flags
++ *
++ * Return Values
++ *	Upon successful completion, scif_registerv() returns the offset
++ *	at which the mapping was placed else an apt error is returned
++ *	as documented in scif.h.
++ */
++off_t
++__scif_registerv(scif_epd_t epd, struct sg_entry *sg_addrs, size_t len, off_t offset,
++					int prot, int map_flags)
++{
++	scif_pinned_pages_t pinned_pages;
++	off_t err;
++	struct endpt *ep = (struct endpt *)epd;
++	uint64_t computed_offset;
++	struct reg_range_t *window;
++	struct mm_struct *mm = NULL;
++
++	/* Unsupported flags */
++	if (map_flags & ~(SCIF_MAP_FIXED | SCIF_MAP_KERNEL))
++		return -EINVAL;
++
++	/* Unsupported protection requested */
++	if (prot & ~(SCIF_PROT_READ | SCIF_PROT_WRITE))
++		return -EINVAL;
++
++	/*
++	 * Offset is not page aligned/negative or offset+len
++	 * wraps around with SCIF_MAP_FIXED.
++	 */
++	if ((map_flags & SCIF_MAP_FIXED) &&
++		((align_low(offset, PAGE_SIZE) != offset) ||
++		(offset < 0) ||
++		(offset + (off_t)len < offset)))
++		return -EINVAL;
++
++
++	might_sleep();
++
++#ifdef DEBUG
++	/* Bad EP */
++	if (!ep)
++		return -EINVAL;
++#endif
++
++	if ((err = verify_epd(ep)))
++		return err;
++
++	/* Compute the offset for this registration */
++	if ((err = micscif_get_window_offset(ep, map_flags, offset,
++			len, &computed_offset)))
++		return err;
++
++	/* Allocate and prepare self registration window */
++	if (!(window = micscif_create_window(ep, len >> PAGE_SHIFT,
++			computed_offset, false))) {
++		micscif_free_window_offset(ep, computed_offset, len);
++		return -ENOMEM;
++	}
++
++	micscif_inc_node_refcnt(ep->remote_dev, 1);
++
++	window->nr_pages = len >> PAGE_SHIFT;
++
++	if ((err = micscif_send_alloc_request(ep, window))) {
++		micscif_destroy_incomplete_window(ep, window);
++		micscif_dec_node_refcnt(ep->remote_dev, 1);
++		return err;
++	}
++
++	if (!(map_flags & SCIF_MAP_KERNEL)) {
++		mm = __scif_acquire_mm();
++		map_flags |= SCIF_MAP_ULIMIT;
++	}
++
++	/* Pin down the pages */
++	if ((err = scif_pin_pagesv(sg_addrs, len, prot,
++			map_flags & (SCIF_MAP_KERNEL | SCIF_MAP_ULIMIT),
++			&pinned_pages))) {
++		micscif_destroy_incomplete_window(ep, window);
++		micscif_dec_node_refcnt(ep->remote_dev, 1);
++		__scif_release_mm(mm);
++		goto error;
++	}
++
++	window->pinned_pages = pinned_pages;
++	window->nr_contig_chunks = pinned_pages->nr_contig_chunks;
++	window->prot = pinned_pages->prot;
++	window->mm = mm;
++
++	/* Prepare the remote registration window */
++	if ((err = micscif_prep_remote_window(ep, window))) {
++		micscif_dec_node_refcnt(ep->remote_dev, 1);
++		micscif_set_nr_pages(ep->remote_dev, window);
++		printk(KERN_ERR "%s %d err %ld\n", __func__, __LINE__, err);
++		goto error_unmap;
++	}
++
++	/* Tell the peer about the new window */
++	if ((err = micscif_send_scif_register(ep, window))) {
++		micscif_dec_node_refcnt(ep->remote_dev, 1);
++		printk(KERN_ERR "%s %d err %ld\n", __func__, __LINE__, err);
++		goto error_unmap;
++	}
++
++	micscif_dec_node_refcnt(ep->remote_dev, 1);
++
++	/* No further failures expected. Insert new window */
++	mutex_lock(&ep->rma_info.rma_lock);
++	set_window_ref_count(window, pinned_pages->nr_pages);
++	micscif_insert_window(window, &ep->rma_info.reg_list);
++	mutex_unlock(&ep->rma_info.rma_lock);
++
++	return computed_offset;
++error_unmap:
++	micscif_destroy_window(ep, window);
++error:
++	printk(KERN_ERR "%s %d err %ld\n", __func__, __LINE__, err);
++	return err;
++}
++
+ off_t
+ scif_register(scif_epd_t epd, void *addr, size_t len, off_t offset,
+ 					int prot, int map_flags)
+@@ -2812,24 +3089,10 @@
+ 	return mask;
+ }
+ 
+-/*
+- * The private data field of each VMA used to mmap a remote window
+- * points to an instance of struct vma_pvt
+- */
+-struct vma_pvt {
+-	struct endpt *ep;	/* End point for remote window */
+-	uint64_t offset;	/* offset within remote window */
+-	bool valid_offset;	/* offset is valid only if the original
+-				 * mmap request was for a single page
+-				 * else the offset within the vma is
+-				 * the correct offset
+-				 */
+-	struct kref ref;
+-};
+-
+ static void vma_pvt_release(struct kref *ref)
+ {
+ 	struct vma_pvt *vmapvt = container_of(ref, struct vma_pvt, ref);
++	kfree(vmapvt->pfns);
+ 	kfree(vmapvt);
+ }
+ 
+@@ -2873,6 +3136,7 @@
+ 	struct micscif_rma_req req;
+ 	struct reg_range_t *window = NULL;
+ 	int err;
++	u64 pfn;
+ 
+ 	might_sleep();
+ 	pr_debug("SCIFAPI munmap: vma_start 0x%lx vma_end 0x%lx\n", 
+@@ -2911,6 +3175,9 @@
+ 
+ 	micscif_destroy_node_dep(ep->remote_dev, nr_pages);
+ 
++        if ((vma->vm_flags & VM_PFNPHI)) 
++                pfn = vmapvt->pfns[0];
++
+ 	/*
+ 	 * The kernel probably zeroes these out but we still want
+ 	 * to clean up our own mess just in case.
+@@ -2962,6 +3229,12 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	if (!(vmapvt->pfns = kmalloc(nr_pages * sizeof(u64), GFP_KERNEL))) {
++		kfree(vmapvt);
++		micscif_rma_put_task(ep, nr_pages);
++		return -ENOMEM;
++	}
++
+ 	vmapvt->ep = ep;
+ 	kref_init(&vmapvt->ref);
+ 
+@@ -3005,23 +3278,25 @@
+ 	 * node's physical memory and not via a struct page.
+ 	 */
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0))
+-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_PFNMAP;
++	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_PFNMAP | VM_PFNPHI;
+ #else
+-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_PFNMAP;
++	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_RESERVED | VM_PFNMAP | VM_PFNPHI;
+ #endif
+ 
+ 	if (!is_self_scifdev(ep->remote_dev))
+ 		((vma)->vm_flags) |= VM_IO;
+ 
+ 	/* Map this range of windows */
+-	if ((err = micscif_rma_list_mmap(window,
+-			start_offset, nr_pages, vma))) {
++	if (!(err = micscif_rma_list_mmap(window,
++			start_offset, nr_pages, vma, vmapvt))) {
+ 		printk(KERN_ERR "%s %d err %d\n", __func__, __LINE__, err);
+ 		goto error;
+ 	}
++
+ 	/* Set up the driver call back */
+ 	vma->vm_ops = &micscif_vm_ops;
+ 	((vma)->vm_private_data) = vmapvt;
++
+ 	/*
+ 	 * For 1 page sized VMAs the kernel (remap_pfn_range) replaces the
+ 	 * offset in the VMA with the pfn, so in that case save off the
+@@ -3038,6 +3313,7 @@
+ 	micscif_dec_node_refcnt(ep->remote_dev, 1);
+ 	if (err) {
+ 		micscif_destroy_node_dep(ep->remote_dev, nr_pages);
++		kfree(vmapvt->pfns);
+ 		kfree(vmapvt);
+ 		printk(KERN_ERR "%s %d err %d\n", __func__, __LINE__, err);
+ 		micscif_rma_put_task(ep, nr_pages);
+diff -Nur mpss-3.5.2-src-orig/micscif/micscif_fd.c mpss-3.5.2-src-modified/micscif/micscif_fd.c
+--- mpss-3.5.2-src-orig/micscif/micscif_fd.c	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/micscif/micscif_fd.c	2018-07-09 17:33:15.936286742 +0300
+@@ -347,6 +347,91 @@
+ 		scif_err_debug(err, "scif_register");
+ 		return err;
+ 	}
++	case SCIF_REGV:
++	{
++		struct mic_priv *priv = (struct mic_priv *)((f)->private_data);
++		struct scifioctl_regv regv;
++		struct sg_entry *sg_buf;
++		off_t ret, tmp_offset, out_offset;
++		int j, i = -1;
++
++		if (copy_from_user(&regv, argp, sizeof(regv))) {
++			err = -EFAULT;
++			goto regv_err;
++		}
++
++		if (regv.flags & SCIF_MAP_KERNEL) {
++			err = -EINVAL;
++			goto regv_err;
++		}
++
++		sg_buf = kmalloc(regv.nr_pages*sizeof(struct sg_entry), GFP_KERNEL);
++		if (!sg_buf) {
++			err = -ENOMEM;
++			goto regv_err_with_buf;
++		}
++
++		if (copy_from_user(sg_buf, regv.sg_array, regv.nr_pages*sizeof(struct sg_entry))) {
++			err = -EFAULT;
++			goto regv_err_with_buf;
++		}
++
++		if (regv.flags & SCIF_MAP_KERNEL) {
++			err = -EINVAL;
++			goto regv_err_with_buf;
++		}
++
++		tmp_offset = regv.offset;
++
++		//TODO: add the first __scif_register and save the out_offset
++		//we assume __scif_register returns us contiguous offsets
++		//TODO: rethink if creating offsets in-parallel from different
++		//VMs may cause a problem
++		if ((out_offset = __scif_register(priv->epd, sg_buf->addr, PAGE_SIZE,
++				tmp_offset, regv.prot, regv.flags)) < 0) {
++			err = (int)out_offset;
++
++			goto regv_err_with_buf;
++		}
++
++		for (i = 1; i < regv.nr_pages; i++) {
++			sg_buf++;
++			tmp_offset += PAGE_SIZE;
++
++			//we assume __scif_register returns us contiguous offsets
++			//TODO: rethink if creating offsets in-parallel from different
++			//VMs may cause a problem
++			if ((ret = __scif_register(priv->epd, sg_buf->addr, PAGE_SIZE,
++					tmp_offset, regv.prot, regv.flags)) < 0) {
++				err = (int)ret;
++
++				goto regv_err_unreg;
++			}
++		}
++
++		if (copy_to_user(&((struct scifioctl_regv*)argp)->out_offset,
++				&out_offset, sizeof(regv.out_offset))) {
++			err = -EFAULT;
++			goto regv_err_unreg;
++		}
++		err = 0;
++
++		goto regv_out;
++
++regv_err_unreg:
++		//we assume __scif_register returns us contiguous offsets
++		for (j = 0; j < i; j++) {
++			__scif_unregister(priv->epd, out_offset, PAGE_SIZE);
++			out_offset += PAGE_SIZE;
++		}
++
++regv_err_with_buf:
++		kfree(sg_buf);
++regv_err:
++		scif_err_debug(err, "scif_registerv");
++regv_out:
++		return err;
++	}
+ 	case SCIF_UNREG:
+ 	{
+ 		struct mic_priv *priv = (struct mic_priv *)((f)->private_data);
+diff -Nur mpss-3.5.2-src-orig/micscif/micscif_rma_list.c mpss-3.5.2-src-modified/micscif/micscif_rma_list.c
+--- mpss-3.5.2-src-orig/micscif/micscif_rma_list.c	2015-05-06 09:57:55.000000000 +0300
++++ mpss-3.5.2-src-modified/micscif/micscif_rma_list.c	2018-07-09 17:37:52.944274554 +0300
+@@ -45,6 +45,7 @@
+ #include "mic_common.h"
+ #endif
+ #include "mic/micscif_map.h"
++#include <linux/mm.h>
+ 
+ /*
+  * micscif_insert_tcw:
+@@ -235,9 +236,10 @@
+ 					req->type == WINDOW_SINGLE)
+ 					return 0;
+ 				/* Extra logic for full windows */
+-				if (offset == end_offset)
++				if (offset == end_offset){
+ 					/* Spanning multiple whole windows */
+ 					return 0;
++				}
+ 				/* Not spanning multiple whole windows */
+ 				return -ENXIO;
+ 			}
+@@ -249,6 +251,15 @@
+ 	return -ENXIO;
+ }
+ 
++//struct vma_pvt {                                                                                                                              
++//        struct endpt *ep;       /* End point for remote window */
++//        uint64_t offset;        /* offset within remote window */
++//        bool valid_offset;      /* offset is valid only if the original
++//                                 * mmap request was for a single page */
++//        struct kref ref;
++//        u64 pfn;
++//};
++
+ /*
+  * micscif_rma_list_mmap:
+  *
+@@ -260,8 +271,7 @@
+  * RMA lock must be held.
+  */
+ int micscif_rma_list_mmap(struct reg_range_t *start_window,
+-	uint64_t offset, int nr_pages, struct vm_area_struct *vma)
+-{
++	uint64_t offset, int nr_pages, struct vm_area_struct *vma, struct vma_pvt *vmapvt)
+ 	struct list_head *item, *head;
+ 	uint64_t end_offset, loop_offset = offset;
+ 	struct reg_range_t *window;
+@@ -286,7 +296,6 @@
+ 				nr_pages_left);
+ 		for (i = (int)start_page_nr;
+ 			i < ((int)start_page_nr + (int)loop_nr_pages); i++, j++) {
+-
+ 			phys_addr =
+ #if !defined(_MIC_SCIF_) && defined(CONFIG_ML1OM)
+ 			is_self_scifdev(ep->remote_dev) ?
+@@ -308,6 +317,8 @@
+ 				((vma)->vm_page_prot))))
+ 				goto error;
+ 			loop_offset += PAGE_SIZE;
++
++			vmapvt->pfns[j] = phys_addr >> PAGE_SHIFT;
+ 		}
+ 		nr_pages_left -= loop_nr_pages;
+ 		if (!nr_pages_left)
+@@ -341,7 +352,8 @@
+ error:
+ 	if (err)
+ 		printk(KERN_ERR "%s %d err %d\n", __func__, __LINE__, err);
+-	return err;
++
++	return  (phys_addr >> PAGE_SHIFT);
+ }
+ 
+ /*

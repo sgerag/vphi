@@ -5,6 +5,8 @@
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 
+
+#include <linux/proc_fs.h>
 #include "virtio_scif.h"
 #include "virtio_scif_chrdev.h"
 #include "debug.h"
@@ -34,6 +36,23 @@
 
 struct scif_driver_data scif_drvdata;
 
+typedef struct mic_data {
+	int32_t                 dd_numdevs;
+//	int32_t                 dd_inuse;
+//#ifdef USE_VCONSOLE
+//	micvcons_port_t         dd_ports[MAX_BOARD_SUPPORTED];
+//#endif
+//	struct board_info       *dd_bi[MAX_BOARD_SUPPORTED];
+	struct board_info       *dd_bi[256];
+//	struct list_head        dd_bdlist;
+//	micscif_pm_t            dd_pm;
+//	uint64_t                sysram;
+//	struct fasync_struct    *dd_fasync;
+//	struct list_head        sku_table[MAX_DEV_IDS];
+} mic_data_t;
+
+mic_data_t mic_data;
+
 typedef struct lindata {
     	dev_t                   dd_dev;
         struct cdev             dd_cdev;
@@ -56,6 +75,7 @@ typedef struct _mic_ctx_t {
 	struct board_info 	*bd_info;
 	uint32_t 		bi_id;
 	struct kernfs_node 	*sysfs_state;
+	spinlock_t              sysfs_lock;
 
 
 } mic_ctx_t;
@@ -390,6 +410,9 @@ mic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 //	dev_set_drvdata(mic_ctx->bd_info->bi_sysfsdev, mic_ctx);
 
 
+//	list_add_tail(&bd_info->bi_list, &mic_data.dd_bdlist);
+	mic_data.dd_numdevs++;
+
 	return 0;
 
 }
@@ -397,8 +420,56 @@ mic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 static void                                                                                                                                   
 mic_remove(struct pci_dev *pdev)
 {
+	int32_t brdnum;
+	bd_info_t *bd_info;
+	//sgerag
+	//mic_ctx_t *mic_ctx = pci_get_drvdata(pdev);
 
+	if (mic_data.dd_numdevs - 1 < 0)
+		return;
+	mic_data.dd_numdevs--;
+	brdnum = mic_data.dd_numdevs;
 
+	/* Make sure boards are shutdown and not available. */
+	bd_info = mic_data.dd_bi[brdnum];
+
+	spin_lock_bh(&bd_info->bi_ctx.sysfs_lock);
+	sysfs_put(bd_info->bi_ctx.sysfs_state);
+	bd_info->bi_ctx.sysfs_state = NULL;
+	spin_unlock_bh(&bd_info->bi_ctx.sysfs_lock);
+
+//	if (bd_info->bi_ctx.bi_psmi.enabled) {
+//		device_remove_bin_file(bd_info->bi_sysfsdev, &mic_psmi_ptes_attr);
+//		sysfs_remove_group(&bd_info->bi_sysfsdev->kobj, &psmi_attr_group);
+//	}
+	sysfs_remove_group(&bd_info->bi_sysfsdev->kobj, &bd_attr_group);
+//
+//	free_sysfs_entries(&bd_info->bi_ctx);
+	device_destroy(mic_lindata.dd_class,
+		       mic_lindata.dd_dev + 2 + bd_info->bi_ctx.bi_id);
+
+//	adapter_stop_device(&bd_info->bi_ctx, 1, 0);
+//	/*
+//	 * Need to wait for reset since accessing the card while GDDR training
+//	 * is ongoing by adapter_remove(..) below for example can be fatal.
+//	 */
+//	wait_for_reset(&bd_info->bi_ctx);
+//
+//	mic_disable_interrupts(&bd_info->bi_ctx);
+//
+//	if (!bd_info->bi_ctx.msie) {
+//		free_irq(bd_info->bi_ctx.bi_pdev->irq, &bd_info->bi_ctx);
+//#ifdef CONFIG_PCI_MSI
+//	} else {
+//	free_irq(bd_info->bi_msix_entries[0].vector, &bd_info->bi_ctx);
+//		pci_disable_msix(bd_info->bi_ctx.bi_pdev);
+//#endif
+//	}
+//	adapter_remove(&bd_info->bi_ctx);
+//	release_mem_region(bd_info->bi_ctx.aper.pa, bd_info->bi_ctx.aper.len);
+//	release_mem_region(bd_info->bi_ctx.mmio.pa, bd_info->bi_ctx.mmio.len);
+//	pci_disable_device(bd_info->bi_ctx.bi_pdev);
+	kfree(bd_info);
 }
 
 static struct pci_device_id mic_pci_tbl[] = {
@@ -446,6 +517,7 @@ static struct pci_device_id mic_pci_tbl[] = {
 //CHECK ./host/linux.c at host
 static int scif_ctrl_create_sysfs(void) 
 {
+	int brdnum = mic_data.dd_numdevs;
 	int ret = 0;
 	bd_info_t *bd_info;
 	mic_ctx_t *mic_ctx;
@@ -602,6 +674,26 @@ void scif_destroy_sysfs(void)
 //        class_destroy(micinfo.m_class);
 ////        cdev_del(&(micinfo.m_cdev));
 ////        unregister_chrdev_region(micinfo.m_dev, 2);
+
+	pci_unregister_driver(&mic_lindata.dd_pcidriver);
+	//micpm_uninit();
+
+	/* Uninit data structures for PM disconnect */
+	//micpm_disconn_uninit(mic_data.dd_numdevs + 1);
+
+
+	//micscif_kmem_cache_destroy();
+	//vmcore_exit();
+	//micveth_exit();
+	//micscif_destroy();
+	//ramoops_exit();
+
+	device_destroy(mic_lindata.dd_class, mic_lindata.dd_dev + 1);
+	device_destroy(mic_lindata.dd_class, mic_lindata.dd_dev);
+	class_destroy(mic_lindata.dd_class);
+	cdev_del(&mic_lindata.dd_cdev);
+	unregister_chrdev_region(mic_lindata.dd_dev, 68);
+//	unregister_pm_notifier(&mic_pm_notifer);
 }
 
 /**
@@ -610,10 +702,72 @@ void scif_destroy_sysfs(void)
  **/
 static void __exit fini(void)
 {
+	int32_t brdnum;
+	bd_info_t *bd_info;
+
 	debug("Entering");
 	scif_chrdev_destroy();
 	unregister_virtio_driver(&virtio_scif);
 //	scif_destroy_sysfs();
+
+
+
+        /* Close endpoints related to reverse registration */
+//	acptboot_exit();
+//
+//#ifdef USE_VCONSOLE
+//	micvcons_destroy(mic_data.dd_numdevs);
+//#endif
+//
+	pci_unregister_driver(&mic_lindata.dd_pcidriver);
+//	micpm_uninit();
+//
+///* Uninit data structures for PM disconnect */
+//	micpm_disconn_uninit(mic_data.dd_numdevs + 1);
+//
+//#if (LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,34))
+//	pm_qos_remove_requirement(PM_QOS_CPU_DMA_LATENCY, "mic");
+//#endif
+//	micscif_kmem_cache_destroy();
+//	vmcore_exit();
+//	micveth_exit();
+//	micscif_destroy();
+//	ramoops_exit();
+//
+	//sgerag
+	//mic_ctx_t *mic_ctx = pci_get_drvdata(pdev);
+
+//	if (mic_data.dd_numdevs - 1 < 0)
+//		return;
+//	mic_data.dd_numdevs--;
+//	brdnum = mic_data.dd_numdevs;
+
+	/* Make sure boards are shutdown and not available. */
+//	bd_info = mic_data.dd_bi[brdnum];
+//
+//	spin_lock_bh(&bd_info->bi_ctx.sysfs_lock);
+//	sysfs_put(bd_info->bi_ctx.sysfs_state);
+//	bd_info->bi_ctx.sysfs_state = NULL;
+//	spin_unlock_bh(&bd_info->bi_ctx.sysfs_lock);
+
+//	if (bd_info->bi_ctx.bi_psmi.enabled) {
+//		device_remove_bin_file(bd_info->bi_sysfsdev, &mic_psmi_ptes_attr);
+//		sysfs_remove_group(&bd_info->bi_sysfsdev->kobj, &psmi_attr_group);
+//	}
+//	sysfs_remove_group(&bd_info->bi_sysfsdev->kobj, &bd_attr_group);
+//
+//	free_sysfs_entries(&bd_info->bi_ctx);
+//	device_destroy(mic_lindata.dd_class,
+//		       mic_lindata.dd_dev + 2 + bd_info->bi_ctx.bi_id);
+	device_destroy(mic_lindata.dd_class,
+		       mic_lindata.dd_dev + 2);
+	device_destroy(mic_lindata.dd_class, mic_lindata.dd_dev + 1);
+	device_destroy(mic_lindata.dd_class, mic_lindata.dd_dev);
+	class_destroy(mic_lindata.dd_class);
+	class_destroy(mic_lindata.dd_class);
+	cdev_del(&mic_lindata.dd_cdev);
+	unregister_chrdev_region(mic_lindata.dd_dev, 68);
+//	unregister_pm_notifier(&mic_pm_notifer);
 
 	debug("Leaving");
 }
